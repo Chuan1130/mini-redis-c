@@ -1,0 +1,21 @@
+# Compiled binaries
+server
+client
+
+# Object files
+*.o
+*.out
+
+# Runtime data
+*.dump
+
+# Local AI / editor files
+.codex
+AGENTS.md
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+
