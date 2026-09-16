@@ -1,979 +1,638 @@
 mini-redis-c
 
-一个用 C 从零搭出来的 Redis-like 内存键值数据库学习项目。
+A Redis-like, single-threaded in-memory KV server written in C — built around RESP2 + non-blocking TCP + poll + hash table + TTL + AOF.
 
-它不是把一个 HashMap 包在 main.c 里就结束，而是沿着真实服务端的路径，把下面这些模块一步步串起来：
+<p align="center">
+  <strong>Client → RESP2 → TCP → poll event loop → command dispatch → Hash DB / AOF → RESP2 response</strong>
+</p>
 
-TCP 服务端 / 客户端
+Project at a glance
 
-poll 多连接事件循环
+Area
 
-非阻塞 Socket
+Current implementation
 
-自定义二进制消息协议
+Networking
 
-命令解析与响应类型系统
+TCP server/client, IPv4, non-blocking sockets
 
-哈希表 + 链表冲突处理
+Event loop
 
-扩容 / rehash
+Single-threaded poll, up to 1024 connection slots
 
-SET / GET / DEL / EXISTS
+Protocol
 
-EXPIRE / TTL 过期语义
+RESP2 basic types + command arrays
 
-SAVE 快照持久化与启动恢复
+Storage
 
-当前主线大致处于 ch08：已经形成一个“客户端 -> 网络 -> 协议 -> 命令 -> 内存 DB -> 持久化 -> 响应”的最小闭环。
+Custom hash table + separate chaining
 
-准确边界说明： 当前代码使用的是项目自定义的长度前缀二进制协议，并不是 Redis 官方 RESP；当前持久化实现是手动 SAVE 的快照，不是 AOF。仓库里会明确保留这些真实边界，不把“后续计划”写成“已经实现”。
+Scaling
 
-1. 先看整体：这个项目运行时到底像什么？
+Load-factor-triggered one-shot rehash
 
-如果完全不看代码，可以先把它想象成一家“内存仓库”。
+Commands
 
-client：来办业务的人，把 SET foo bar 这样的命令交给服务端。
+SET GET DEL EXISTS EXPIRE PEXPIREAT TTL PTTL + utility commands
 
-tcp_server.c：前台 + 调度中心，负责接入连接、收请求、分发命令、回响应。
+Expiration
 
-codec.c / proto.c：翻译和装箱层，把“人输入的命令”变成网络字节，再把网络字节恢复成结构化命令。
+Lazy deletion + budgeted periodic scan
 
-db.c：真正的仓库，负责 key/value 在内存中的查找、写入、删除、过期和 rehash。
+Persistence
 
-persist.c：账本，负责 SAVE 时把当前有效数据保存到 my_redis.dump，并在下次启动时恢复。
+AOF append + fsync policy + replay + tail repair + synchronous rewrite
+
+Safety limits
+
+Frame / bulk / key / value / nesting limits
+
+Verification
+
+Integration test, sanitizer run, latency/recovery/memory tools
+
+Scope: this is a learning-oriented Redis-like server, not a production Redis replacement. The README intentionally separates implemented behavior from future work.
+
+1. System picture
 
 flowchart LR
-    U[终端输入<br/>SET foo bar] --> C[tcp_client.c<br/>拆参数 + 编码请求]
-    C --> P1[proto.c<br/>加 4 字节消息长度]
-    P1 --> TCP[(TCP 字节流)]
-    TCP --> S[tcp_server.c<br/>poll + Conn 状态机]
-    S --> CO[codec.c<br/>parse_req]
-    CO --> D{do_request<br/>命令分发}
-    D -->|SET/GET/DEL/EXISTS/EXPIRE/TTL| DB[db.c<br/>哈希表数据库]
-    D -->|SAVE| PS[persist.c<br/>快照保存]
-    DB --> R[Resp<br/>OK / ERR / STR / INT / NIL]
-    PS --> R
-    R --> CO2[codec.c<br/>make_resp]
-    CO2 --> S2[tcp_server.c<br/>非阻塞写回]
-    S2 --> TCP2[(TCP)]
-    TCP2 --> CL[client<br/>parse_resp + print_resp]
+    U[User<br/>SET foo bar] --> CLI[Client<br/>tcp_client.c]
+    CLI --> ENC[RESP2 encode<br/>resp.c]
+    ENC --> TCP[(TCP byte stream)]
+    TCP --> LOOP[poll event loop<br/>tcp_server.c]
+    LOOP --> CONN[Conn.rbuf<br/>partial request state]
+    CONN --> PARSE[Incremental RESP2 parser]
+    PARSE --> CMD{Command dispatch}
+    CMD -->|write command| AOF[AOF append / fsync]
+    CMD -->|read command| DB[Hash DB]
+    AOF --> DB
+    DB --> RESP[RESP2 response]
+    RESP --> WRITE[Non-blocking write]
+    WRITE --> TCP2[(TCP)]
+    TCP2 --> OUT[Client output]
 
-一条命令从你按下回车开始，会真实经过：
+One SET foo bar request, end to end
 
-你输入命令
-   ↓
-client 把一行文字拆成 argc / argv
-   ↓
-编码成二进制 request payload
-   ↓
-前面再加 4 字节 body 长度
-   ↓
-通过 TCP 发给 server
-   ↓
-server 的 poll 发现这个连接“可读”
-   ↓
-Conn 状态机先读 4 字节长度，再读完整 body
-   ↓
-parse_req 把 body 还原成 Args
-   ↓
-do_request 根据 argv[0] 判断是什么命令
-   ↓
-进入 db.c 或 persist.c
-   ↓
-得到一个 Resp 语义结果
-   ↓
-make_resp 把结果重新编码成网络字节
-   ↓
-poll 等待 socket 可写
-   ↓
-server 分段写回 client
-   ↓
-client 解析 RespView
-   ↓
-终端看到 < OK / < bar / < 1 / < (nil)
+sequenceDiagram
+    participant U as User
+    participant C as Client
+    participant S as Server/poll
+    participant P as RESP parser
+    participant A as AOF
+    participant D as Hash DB
 
-2. 当前已经实现了什么？
+    U->>C: SET foo bar
+    C->>S: RESP2 bytes over TCP
+    Note over S: bytes may arrive in several reads
+    S->>P: parse Conn.rbuf
+    P-->>S: OK / NEED_MORE / INVALID
+    S->>A: append canonical write command
+    A-->>S: persisted according to fsync policy
+    S->>D: db_set(foo, bar)
+    D-->>S: success
+    S-->>C: +OK\r\n
+    C-->>U: < OK
 
-层
+2. What is implemented
 
-已实现能力
+Core command set
 
-当前实现方式
+Category
 
-网络层
+Commands
 
-TCP Server / Client
+Connectivity
 
-IPv4 + SOCK_STREAM
+PING [message], ECHO message, QUIT
 
-多连接
+String KV
 
-同时维护多个客户端
+SET key value, GET key
 
-poll + 最多 1024 个 Conn 槽位
+Key operations
 
-非阻塞 I/O
+DEL key, EXISTS key, DBSIZE
 
-accept/read/write 不拖死整个事件循环
+Expiration
 
-fcntl(..., O_NONBLOCK)
+EXPIRE key seconds, PEXPIREAT key unix_ms, TTL key, PTTL key
 
-消息边界
+Persistence
 
-解决 TCP 没有消息边界的问题
+AOFREWRITE
 
-[4-byte body_len][body]
+Introspection
 
-请求编解码
+INFO
 
-命令参数序列化
+Basic client compatibility
 
-[argc][arg_len][arg_bytes]...
+HELLO 2, SELECT 0, CLIENT SETINFO, CLIENT SETNAME, CLIENT GETNAME, COMMAND
 
-响应类型
+The compatibility commands above are intentionally minimal. This is not a complete Redis server.
 
-区分成功、错误、字符串、整数、空值
+3. Networking model
 
-RESP_OK / ERR / STR / INT / NIL
-
-KV 存储
-
-字符串 key/value
-
-哈希桶 + 链表
-
-哈希冲突
-
-多个 key 落入同一桶
-
-separate chaining
-
-扩容
-
-降低桶链越来越长的问题
-
-负载超过约 75% 时整体 rehash
-
-删除
-
-删除 key 并释放资源
-
-db_del + 链表摘节点
-
-存在性
-
-判断 key 是否存在
-
-EXISTS / db_exists
-
-过期
-
-设置 TTL
-
-EXPIRE key seconds
-
-TTL 查询
-
-查询剩余秒数
-
-TTL，支持 -1 / -2 语义
-
-过期清理
-
-访问时清理已过期 key
-
-lazy expiration
-
-持久化
-
-手动保存当前有效数据
-
-SAVE -> my_redis.dump
-
-启动恢复
-
-服务启动时尝试恢复快照
-
-persist_load
-
-学习轨迹
-
-保留每章演进
-
-docs/ + archive/
-
-当前命令集：
-
-SET key value
-GET key
-DEL key
-EXISTS key
-EXPIRE key seconds
-TTL key
-SAVE
-
-3. 服务端宏观画面：一个单线程事件循环如何照看很多连接？
-
-3.1 启动时
-
-./server 启动后会依次做：
+The server startup path is roughly:
 
 socket()
-  ↓
-setsockopt(SO_REUSEADDR)
-  ↓
-bind(0.0.0.0:15001)
-  ↓
-listen()
-  ↓
-db_init(&g_db)
-  ↓
-persist_load(&g_db, "my_redis.dump")
-  ↓
-把监听 socket 设为 NONBLOCK
-  ↓
-进入 while(1) + poll(...)
+  → setsockopt(SO_REUSEADDR)
+  → bind(0.0.0.0:15001)
+  → listen()
+  → set_nonblocking()
+  → initialize DB
+  → replay AOF
+  → poll loop
 
-可以把它想成：
+Why poll + non-blocking sockets?
 
-先开店门
-→ 再把仓库初始化
-→ 再把昨天的快照恢复回来
-→ 最后坐进总控室，等操作系统通知“哪个连接有事了”
+Instead of letting one client block the entire process, the server asks the OS:
 
-服务端监听端口：
+Which fd is ready to accept?
+Which fd is readable?
+Which fd can continue writing?
 
-0.0.0.0:15001
+stateDiagram-v2
+    [*] --> Waiting
+    Waiting --> Accepting: listen fd readable
+    Waiting --> Reading: client fd readable
+    Waiting --> Writing: client fd writable
+    Accepting --> Waiting
+    Reading --> Waiting
+    Writing --> Waiting
 
-客户端默认连接：
+Per-connection state
 
-127.0.0.1:15001
+Every client connection keeps its own in-memory progress:
 
-3.2 为什么不是每个连接都一直 read()？
+Conn
+├── fd                 socket descriptor
+├── rbuf / rlen / rcap received but not yet consumed bytes
+├── wbuf / wlen        current response buffer
+├── wsent              bytes already written
+└── close_after_write  close after final response when needed
 
-因为那样一个慢客户端就可能卡住整个服务。
+That state is what lets the server handle:
 
-当前服务端做的是：
+partial reads — one command arrives across several read() calls;
 
-poll：谁准备好了？
-   ↓
-连接 A 可读 → 只处理 A
-连接 B 可写 → 只处理 B
-监听 fd 可读 → accept 新连接
-其余连接没事件 → 不碰
+partial writes — one response requires several write() calls;
+
+pipelining — multiple commands already buffered in the same connection.
+
+<details>
+<summary><strong>Visual example: one command split across TCP reads</strong></summary>
+
+Full request:
+*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
+
+Actual reads:
+read #1  "*3\r\n$3\r\nSE"
+read #2  "T\r\n$3\r\nfoo\r\n"
+read #3  "$3\r\nbar\r\n"
+
+The bytes are appended to Conn.rbuf. The parser returns NEED_MORE until one complete RESP frame exists.
+
+</details>
+
+4. RESP2 protocol
+
+The implementation understands the five basic RESP2 frame shapes:
+
+Type
+
+Example
+
+Simple String
+
++OK\r\n
+
+Error
+
+-ERR message\r\n
+
+Integer
+
+:1\r\n
+
+Bulk String
+
+$3\r\nfoo\r\n
+
+Array
+
+*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n
+
+Commands are sent as Array of Bulk Strings.
+
+Example: SET foo bar
+
+*3\r\n
+$3\r\n
+SET\r\n
+$3\r\n
+foo\r\n
+$3\r\n
+bar\r\n
+
+Incremental parsing result
 
 flowchart TD
-    LOOP[while 1] --> BUILD[构造 pollfd 列表]
-    BUILD --> POLL[poll 等待事件]
-    POLL --> L{监听 fd 可读?}
-    L -->|是| AC[accept 尽可能多的新连接]
-    L -->|否| E[检查已有客户端]
-    AC --> E
-    E --> R{当前 Conn 状态}
-    R -->|ST_READ_LEN / ST_READ_BODY| READ[关心 POLLIN]
-    R -->|ST_WRITE_RESP| WRITE[关心 POLLOUT]
-    READ --> LOOP
-    WRITE --> LOOP
+    R[read new bytes] --> B[append to Conn.rbuf]
+    B --> P[resp_parse_command]
+    P --> N{result}
+    N -->|NEED_MORE| WAIT[keep bytes and wait for next POLLIN]
+    N -->|INVALID| ERR[send protocol error then close]
+    N -->|OK| EXEC[build Args + consumed bytes]
+    EXEC --> SHIFT[consume parsed prefix]
+    SHIFT --> MORE{more complete frames buffered?}
+    MORE -->|yes| P
+    MORE -->|no| WAIT
 
-4. 微观核心：Conn 就是一张“这个客户端办到哪一步”的进度卡
+Safety limits
 
-非阻塞 I/O 最关键的地方，是一次 read 不保证把一条请求读完整，一次 write 也不保证把响应一次发完。
+Limit
 
-所以每个客户端都有一份 Conn：
+Current bound
 
-typedef struct {
-    int fd;
-    ConnState st;
+Bulk String
 
-    uint8_t lenbuf[4];
-    size_t len_got;
-    uint32_t body_len;
-    uint8_t *body;
-    size_t body_got;
+512 KiB
 
-    uint8_t *wbuf;
-    size_t wlen;
-    size_t wsent;
-} Conn;
+Per-connection request buffer
 
-可以把它脑补成下面这张表：
+1 MiB
 
-客户端 #17
-┌────────────────────────────────────┐
-│ fd        = 17                     │
-│ state     = ST_READ_BODY           │
-│ len_got   = 4 / 4                  │ ← 长度已经收齐
-│ body_len  = 23                     │ ← 这条请求一共 23 字节
-│ body_got  = 11 / 23                │ ← 目前只收到了 11 字节
-│ wbuf      = NULL                   │ ← 还没执行完，没有响应
-│ wsent     = 0                      │
-└────────────────────────────────────┘
+RESP frame
 
-下一轮 poll 再告诉服务端“17 号连接可读”时，程序不会从头开始，而是直接从 body + 11 继续收剩下的 12 字节。
+1 MiB
 
-状态只有三个：
+Command argument count
 
-ST_READ_LEN
-    │  收齐 4 字节长度
-    ▼
-ST_READ_BODY
-    │  收齐完整 body + 执行命令
-    ▼
-ST_WRITE_RESP
-    │  响应全部写完
-    └──────────────────────► ST_READ_LEN
+64
 
-这就是当前项目处理 半包、部分写、非阻塞连接进度 的核心。
+Key
 
-5. TCP 没有“消息”概念，所以协议必须自己划边界
+4 KiB
 
-当前项目不是 Redis 官方 RESP，而是自己实现了一套更适合学习 TCP framing 的二进制协议。
+Value
 
-最外层：
+512 KiB
 
-┌──────────────────────┬──────────────────────────────┐
-│ 4 bytes body length  │ body                         │
-└──────────────────────┴──────────────────────────────┘
+RESP nesting depth
 
-例如网络告诉你 body 长度是 27，服务端就知道：
+8
 
-前 4 字节：只负责告诉我后面有多少字节
-后 27 字节：才是一整条完整请求
+These limits are defensive bounds, not a complete production-grade large-key strategy.
 
-这样就不会错误地假设：
+5. Hash-table database
 
-一次 read == 一条命令   ❌
+Memory structure
 
-实际可能是：
+Db
+├── DbNode **buckets
+├── bucket_count
+├── size
+├── expire_cursor
+├── payload_bytes
+└── node_bytes
 
-read #1 → 只收到长度字段前 2 字节
-read #2 → 再收到长度字段 2 字节 + body 前 6 字节
-read #3 → 收到剩下 body
+A single KV node stores metadata plus the key/value payload:
 
-Conn.len_got 和 Conn.body_got 就是专门记这个进度的。
+DbNode
+┌───────────────────────────────┐
+│ key_len                       │
+│ val_len                       │
+│ has_expire                    │
+│ expire_at_ms                  │
+│ next                          │
+├───────────────────────────────┤
+│ key bytes                     │
+├───────────────────────────────┤
+│ value bytes                   │
+└───────────────────────────────┘
 
-6. 一条 SET foo bar 在网络里到底长什么样？
+Collision picture
 
-客户端当前把一行输入按空格切开：
+bucket[0] → NULL
 
-SET foo bar
+bucket[1] → [foo=bar] → [user=chuan] → NULL
+                         ↑
+                    hash collision
 
-得到：
+bucket[2] → [count=10] → NULL
 
-argc = 3
-argv[0] = "SET"
-argv[1] = "foo"
-argv[2] = "bar"
+The lookup path is:
 
-请求 payload：
-
-┌────────────┐
-│ argc = 3   │ 4 bytes
-├────────────┤
-│ len = 3    │ 4 bytes
-├────────────┤
-│ "SET"      │ 3 bytes
-├────────────┤
-│ len = 3    │ 4 bytes
-├────────────┤
-│ "foo"      │ 3 bytes
-├────────────┤
-│ len = 3    │ 4 bytes
-├────────────┤
-│ "bar"      │ 3 bytes
-└────────────┘
-
-然后 proto.c 在整个 payload 前面再套一层：
-
-[4-byte payload length][argc][len][SET][len][foo][len][bar]
-
-所有 4 字节整数都使用网络字节序。
-
-服务端收齐 body 后，parse_req 不复制参数内容，而是得到一个视图：
-
-Args
-├── argc = 3
-├── argv[0] ───────► body 中的 "SET"
-├── argv[1] ───────► body 中的 "foo"
-└── argv[2] ───────► body 中的 "bar"
-
-这也是为什么 db_set 不能直接保存 argv[i] 的指针：
-
-请求处理结束
-  ↓
-Conn.body 会被释放
-  ↓
-如果 DB 只是存了指针
-  ↓
-数据库里就会留下悬空指针
-
-因此 db_set 会重新 malloc 并复制 key/value，数据库自己拥有它们的生命周期。
-
-7. 命令层：网络世界和数据库世界之间的“总机”
-
-服务端把 request 解析成 Args 后进入：
-
-do_request(&args, &resp)
-
-可以把它看成一个交换机：
-
-argv[0]
-   │
-   ├── SET ───────► db_set
-   ├── GET ───────► db_get
-   ├── DEL ───────► db_del
-   ├── EXISTS ────► db_exists
-   ├── EXPIRE ────► db_expire
-   ├── TTL ───────► db_ttl
-   └── SAVE ──────► persist_save
-
-数据库层返回状态后，命令层不会直接打印字符串，而是先形成一个“语义响应对象” Resp：
-
-RESP_OK   → 操作成功，没有额外数据
-RESP_ERR  → 真正错误
-RESP_STR  → GET 找到了字符串
-RESP_INT  → DEL / EXISTS / TTL 等整数结果
-RESP_NIL  → GET 正常执行，但 key 不存在
-
-这里一个重要设计点是：
-
-GET missing
-
-不是“错误”，而是“查询结果为空”，所以是 RESP_NIL，不是 RESP_ERR。
-
-8. 内存数据库：不是数组，而是“桶数组 + 冲突链表”
-
-核心结构：
-
-typedef struct DbNode {
-    uint8_t *key;
-    uint32_t key_len;
-    uint8_t *val;
-    uint32_t val_len;
-    bool has_expire;
-    int64_t expire_at_ms;
-    struct DbNode *next;
-} DbNode;
-
-typedef struct {
-    DbNode *buckets[2048];
-    size_t bucket_count;
-    size_t size;
-} Db;
-
-初始化时：
-
-bucket_count = 256
-size = 0
-
-脑海里的真实画面：
-
-buckets
-
-[0] ───► NULL
-[1] ───► [key="foo", val="bar"] ───► [key="user", val="alice"] ───► NULL
-[2] ───► NULL
-[3] ───► [key="count", val="8"] ───► NULL
-...
-[255] ─► NULL
-
-为什么一个桶里会有多个节点？
-
-因为：
-
-hash(foo) % bucket_count
-hash(user) % bucket_count
-
-可能刚好算出同一个桶下标。
-
-这叫 hash collision。
-
-当前项目不覆盖旧节点，而是用链表挂在同一个 bucket 下面。
-
-key 怎么找到桶？
-
-当前哈希函数使用 FNV-1a 风格：
-
-key 的每个字节
-   ↓ XOR
-hash
-   ↓ × 常量
-新的 hash
-   ↓
-重复直到 key 结束
+hash(key)
    ↓
 hash % bucket_count
    ↓
-桶下标
+select bucket
+   ↓
+walk linked list
+   ↓
+key_len equal AND memcmp equal
 
-即使已经定位到桶，也不能直接认为找到 key：
+Why one allocation per KV?
 
-“落在同一个桶” ≠ “是同一个 key”
+Instead of:
 
-还必须沿链表逐个检查：
+malloc(node)
+malloc(key)
+malloc(value)
 
-key_len 相同
-AND
-memcmp(key bytes) 相同
+the current node layout uses one contiguous allocation:
 
-9. SET 的微观逻辑：写一个 key 时到底发生了什么？
+[ metadata ][ key bytes ][ value bytes ]
 
-以：
+This reduces allocation count and allocator metadata overhead. It is a real implementation optimization, but it does not by itself prove a universal “fragmentation < 5%” claim; that still needs measurement in a fixed environment.
 
-SET foo bar
-
-为例。
+6. SET at code level
 
 flowchart TD
-    A[db_set foo bar] --> B{插入后负载会 > 75%?}
-    B -->|是| RH[rehash 到更多桶]
-    B -->|否| H[计算 foo 的桶下标]
-    RH --> H
-    H --> F[沿桶链查找 foo]
-    F --> X{找到仍有效节点?}
-    X -->|是| U[复制新 value<br/>释放旧 value<br/>覆盖 val]
-    U --> E[清除旧过期时间]
-    X -->|否| C[复制 key / value]
-    C --> N[malloc DbNode]
-    N --> I[头插到 bucket 链表]
-    I --> S[db.size++]
+    A[SET key value] --> V[Validate args and size limits]
+    V --> L[AOF append canonical SET]
+    L --> F{append/fsync successful?}
+    F -->|no| REJ[Reject write]
+    F -->|yes| H[db_set]
+    H --> RH{predicted load > 0.75?}
+    RH -->|yes| REHASH[Double buckets + rehash]
+    RH -->|no| FIND[Hash key and scan bucket chain]
+    REHASH --> FIND
+    FIND --> OLD{live key exists?}
+    OLD -->|yes| REP[Allocate replacement node<br/>replace old value<br/>clear old TTL]
+    OLD -->|no| NEW[Allocate new node<br/>insert into bucket<br/>size++]
+    REP --> OK[+OK]
+    NEW --> OK
 
-如果是覆盖已有 key：
+The write order is intentionally:
 
-旧节点：foo -> old
-          TTL = 10s
-
-SET foo new
-
-结果：foo -> new
-      has_expire = false
-
-也就是说，当前语义里重新 SET 会清掉旧 TTL。
-
-10. 为什么要 rehash？
-
-如果一直只有 256 个桶，但越来越多 key 塞进来，会出现：
-
-bucket[7]
+validate
    ↓
-node A
+append AOF
    ↓
-node B
+apply in-memory change
    ↓
-node C
+reply to client
+
+The aim is to avoid acknowledging a write whose recovery log was never created.
+
+<details>
+<summary><strong>Failure boundary</strong></summary>
+
+If AOF append succeeds but the following in-memory db_set fails because of OOM, the teaching implementation treats the AOF as the recovery source of truth and requires restart rather than pretending the live in-memory state is healthy.
+
+This is an explicit project design choice, not a claim that it matches every production Redis failure semantic.
+
+</details>
+
+7. Rehash
+
+Initial bucket count:
+
+256
+
+When the predicted load factor exceeds about 0.75, the table doubles:
+
+256 → 512 → 1024 → ... → 65536
+
+flowchart LR
+    OLD[Old buckets] --> WALK[Walk every DbNode]
+    WALK --> HASH[hash(key) % new_bucket_count]
+    HASH --> LINK[Relink node into new bucket]
+    LINK --> NEXT{more nodes?}
+    NEXT -->|yes| WALK
+    NEXT -->|no| DONE[Replace bucket table]
+
+The nodes themselves are reused; key/value payloads are not copied again during rehash.
+
+Current implementation uses one-shot rehash. A large table can therefore create a latency spike. Incremental rehash is a natural future improvement.
+
+8. Expiration
+
+Each node can carry:
+
+has_expire = true
+expire_at_ms = absolute timestamp
+
+Example:
+
+now = 100000 ms
+EXPIRE foo 10
+→ expire_at_ms = 110000 ms
+
+Two cleanup paths
+
+flowchart LR
+    KEY[Expired key] --> ACCESS{Accessed?}
+    ACCESS -->|yes| LAZY[Lazy deletion<br/>unlink + free]
+    ACCESS -->|no| CYCLE[Periodic expiration cycle]
+    CYCLE --> BUDGET[Scan limited buckets/nodes]
+    BUDGET --> FREE[Remove expired nodes]
+
+Lazy deletion
+
+GET / EXISTS / DEL / TTL check expiry when looking up a key:
+
+found node
    ↓
-node D
-   ↓
-node E
-   ↓
-...
+now >= expire_at_ms ?
+   ├── no  → use node
+   └── yes → unlink + free + behave as NOT_FOUND
 
-这时所谓的“哈希查找”最后会越来越像在链表里扫描。
+Periodic scan
 
-当前实现会在“下一次插入后元素数超过桶数约 3/4”时尝试扩容。
+The event loop also performs a bounded expiration cycle about every 100 ms:
 
-256 buckets
-   ↓ 负载升高
-512 buckets
-   ↓
-1024 buckets
-   ↓
-2048 buckets（当前上限）
+up to 16 buckets
+up to 128 nodes
 
-rehash 不是重新复制所有 key/value，而是：
+expire_cursor remembers where the next cycle should continue.
 
-旧 bucket 数 = 256
-        ↓
-遍历所有 DbNode
-        ↓
-用新的 bucket_count 再算一次下标
-        ↓
-重新连接 next 指针
-        ↓
-节点本身继续复用
+This balances three goals:
 
-所以它本质上是：
+Goal
 
-数据没有重建，但“每个节点住在哪个桶”重新安排了一遍。
+Mechanism
 
-11. 过期系统：现在采用“懒删除”
+Expired values must not be visible
 
-每个节点可以带：
+Lazy check on access
 
-has_expire
-expire_at_ms
+Unvisited expired keys should eventually be reclaimed
 
-例如当前绝对时间：
+Periodic scan
 
-100000 ms
+One scan should not freeze the single-threaded loop
 
-执行：
+Fixed per-cycle budget
 
-EXPIRE foo 1
+9. AOF persistence
 
-数据库保存的不是“1 秒”，而是：
+Default file:
 
-expire_at_ms = 100000 + 1000 = 101000
+appendonly.aof
 
-之后查找时：
+The AOF itself contains RESP2 write commands, for example:
 
-now_ms < 101000  → 仍有效
-now_ms >= 101000 → 已过期
+*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
+*3\r\n$6\r\nEXPIRE\r\n$3\r\nfoo\r\n$2\r\n10\r\n
 
-当前没有后台过期线程，也没有定期扫描。
+That lets the project reuse the same concepts for both network commands and recovery.
 
-所以：
+fsync modes
 
-foo 已经过期
-   ↓
-它可能暂时还物理存在于桶链里
-   ↓
-GET / EXISTS / TTL 等再次碰到它
-   ↓
-db_find_live_node 发现过期
-   ↓
-从链表摘掉
-   ↓
-free(key)
-free(value)
-free(node)
-size--
-   ↓
-对上层表现为“不存在”
+Set with:
 
-这就是 lazy expiration。
+MYREDIS_FSYNC=always
+MYREDIS_FSYNC=everysec   # default
+MYREDIS_FSYNC=no
 
-TTL 返回值
+Mode
 
->= 0  → 剩余秒数
--1    → key 存在，但没有设置过期时间
--2    → key 不存在，或已过期并被视为不存在
+Meaning
 
-12. DEL 微观逻辑：链表删除最容易错在哪里？
+always
 
-假设一个桶是：
+fsync after every write command; stronger durability, higher I/O cost
 
-bucket[10] ─► A ─► B ─► C ─► NULL
+everysec
 
-删除 A：
+append normally, fsync roughly once per second
 
-bucket[10] = A->next
+no
 
-变成：
+no explicit fsync from the project; OS decides flush timing
 
-bucket[10] ─► B ─► C
-
-删除 B：
-
-A->next = B->next
-
-变成：
-
-bucket[10] ─► A ─► C
-
-之后必须完整释放：
-
-free(node->key)
-free(node->val)
-free(node)
-db->size--
-
-所以删除不是一句“把 key 标没了”，而是一个真实的链表摘除 + 所有权回收过程。
-
-13. 响应为什么还要分类型？
-
-如果服务端所有东西都返回字符串：
-
-"0"
-
-客户端无法判断：
-
-这是字符串值 "0"？
-还是 DEL 删除了 0 个 key？
-还是 TTL 为 0？
-
-所以当前协议定义：
-
-RESP_OK
-RESP_ERR
-RESP_STR
-RESP_INT
-RESP_NIL
-
-响应 body 大致是：
-
-OK / NIL
-┌─────────────┐
-│ 4-byte type │
-└─────────────┘
-
-STR / ERR
-┌─────────────┬────────────┬─────────────┐
-│ 4-byte type │ 4-byte len │ data bytes  │
-└─────────────┴────────────┴─────────────┘
-
-INT
-┌─────────────┬──────────────────┐
-│ 4-byte type │ 8-byte integer   │
-└─────────────┴──────────────────┘
-
-最外层还会再包：
-
-[4-byte body_len][response body]
-
-14. 一条 GET foo 的完整源码级旅行
-
-如果前面已经：
-
-SET foo bar
-
-现在输入：
-
-GET foo
-
-运行路径是：
-
-① tcp_client.c
-   fgets() 读到 "GET foo"
-
-② build_req()
-   argc=2
-   argv[0]="GET"
-   argv[1]="foo"
-
-③ proto.c / send_msg()
-   发送 [body_len][request body]
-
-④ server / poll()
-   发现该 client fd 有 POLLIN
-
-⑤ conn_on_readable()
-   ST_READ_LEN：读满 4-byte length
-   ST_READ_BODY：读满 request body
-
-⑥ codec.c / parse_req()
-   body → Args
-
-⑦ tcp_server.c / do_request()
-   argv[0] == GET
-   → db_get(&g_db, "foo", ...)
-
-⑧ db.c
-   hash("foo")
-   → % bucket_count
-   → 找到目标桶
-   → 沿 next 查节点
-   → 检查是否过期
-   → 找到 value="bar"
-
-⑨ do_request()
-   resp.type = RESP_STR
-   resp.data = "bar"
-
-⑩ codec.c / make_resp()
-   Resp → [body_len][type][len][bar]
-
-⑪ Conn
-   wbuf = 完整响应
-   wsent = 0
-   state = ST_WRITE_RESP
-
-⑫ poll()
-   等 fd 出现 POLLOUT
-
-⑬ conn_on_writable()
-   能写多少写多少
-   如果只写一部分，保存 wsent
-   下轮继续
-
-⑭ 写完
-   free(wbuf)
-   state = ST_READ_LEN
-   等同一连接的下一条请求
-
-⑮ client / recv_msg()
-   收到完整 response body
-
-⑯ parse_resp()
-   得到 RESP_STR
-
-⑰ print_resp()
-   打印：
-   < bar
-
-这一条路径基本把项目所有核心层都串起来了。
-
-15. 持久化：当前实现是快照，不是 AOF
-
-当前持久化入口：
-
-SAVE
-
-保存文件：
-
-my_redis.dump
-
-文件格式：
-
-[4-byte magic = "MYR1"]
-[4-byte entry_count]
-
-重复 entry_count 次：
-    [4-byte key_len]
-    [key bytes]
-    [4-byte val_len]
-    [value bytes]
-    [4-byte has_expire]
-    如果有过期时间：
-        [8-byte expire_at_ms]
-
-SAVE
+Startup replay
 
 flowchart TD
-    S[SAVE] --> O[打开 my_redis.dump: wb]
-    O --> M[写 magic MYR1]
-    M --> C[统计仍有效的 entry 数量]
-    C --> W[遍历所有 bucket / node]
-    W --> X{节点已过期?}
-    X -->|是| SKIP[跳过]
-    X -->|否| DATA[写 key/value/expire metadata]
-    DATA --> W
-    SKIP --> W
-    W --> END[关闭文件]
+    START[server start] --> DBI[db_init]
+    DBI --> OPEN[open appendonly.aof]
+    OPEN --> PARSE[parse RESP2 command]
+    PARSE --> APPLY[replay SET / DEL / EXPIRE / PEXPIREAT]
+    APPLY --> MORE{more complete commands?}
+    MORE -->|yes| PARSE
+    MORE -->|no| TAIL{truncated tail?}
+    TAIL -->|yes| TRUNC[ftruncate to last_good_offset]
+    TAIL -->|no| READY[open AOF O_APPEND]
+    TRUNC --> READY
+    READY --> LISTEN[start accepting clients]
 
-保存时不会把已经过期的数据写进去。
+Tail repair
 
-服务启动恢复
+If the process crashes while writing the last command, replay may end with an incomplete frame.
 
-服务端启动会调用：
+... complete command ...
+*3\r\n$3\r\nSET\r\n$6\r\nbroken\r\n$5\r\npar
+                                      ↑ EOF
 
-persist_load(&g_db, "my_redis.dump")
+If the damage is only at the file tail, the server truncates back to last_good_offset and continues. If invalid RESP appears in the middle of the file, startup fails instead of silently skipping corrupted state.
 
-恢复没有直接往 g_db 一边读一边塞，而是：
+10. AOF rewrite
 
-文件
-  ↓
-校验 magic == MYR1
-  ↓
-创建临时数据库 tmp
-  ↓
-一条条读取
-  ↓
-跳过已经过期的记录
-  ↓
-全部成功？
-  ├── 否 → 丢弃 tmp，原 db 尽量不受污染
-  └── 是 → free 原 db，再用 tmp 替换
+Command:
 
-这个设计避免了：
+AOFREWRITE
 
-坏快照读到一半
-→ 主数据库只恢复了一半
-→ 形成半新半旧状态
+The rewrite is based on the current live keyspace, not by blindly compressing old log text.
 
-16. 项目目录和每个文件的职责
+flowchart LR
+    DB[(Current live DB)] --> TMP[appendonly.aof.tmp]
+    TMP --> SETS[Write minimal SET commands]
+    SETS --> TTL[Write PEXPIREAT for expiring keys]
+    TTL --> FS[fsync temp file]
+    FS --> RN[rename temp → appendonly.aof]
+    RN --> REOPEN[reopen with O_APPEND]
+
+Example:
+
+Current DB:
+foo = bar
+user = chuan, expire_at = ...
+
+Rewritten AOF:
+SET foo bar
+SET user chuan
+PEXPIREAT user <absolute-ms>
+
+Current rewrite is synchronous. That avoids concurrent-write merge complexity, but blocks the single-threaded event loop while rewriting. Background rewrite is future work.
+
+11. Project layout
 
 mini-redis-c/
 ├── Makefile
 ├── README.md
-│
 ├── include/
-│   ├── codec.h       请求 Args、RespType、Resp / RespView、编解码接口
-│   ├── db.h          Db / DbNode、数据库操作接口
-│   ├── nb.h          set_nonblocking
-│   ├── persist.h     SAVE / load 接口、快照文件名
-│   └── proto.h       最外层消息收发 [length][payload]
-│
+│   ├── aof.h
+│   ├── db.h
+│   ├── nb.h
+│   └── resp.h
 ├── src/
-│   ├── tcp_server.c  服务端主入口、poll、Conn 状态机、命令分发
-│   ├── tcp_client.c  CLI 客户端、命令切分、结果打印
-│   ├── codec.c       request / response payload 编解码
-│   ├── proto.c       阻塞式 read_full/write_all/send_msg/recv_msg（客户端使用）
-│   ├── db.c          哈希表、链表、rehash、删除、EXPIRE / TTL
-│   ├── persist.c     快照保存和启动加载
-│   └── nb.c          fcntl + O_NONBLOCK
-│
-├── docs/
-│   ├── ch00_notes.md ... ch08_notes.md
-│   └── runtime_walkthrough.md
-│
-└── archive/
-    └── 各章节早期版本 / 开发计划，用于保留演进轨迹
+│   ├── aof.c
+│   ├── db.c
+│   ├── nb.c
+│   ├── resp.c
+│   ├── tcp_client.c
+│   └── tcp_server.c
+├── tests/
+│   └── integration.py
+├── tools/
+│   ├── benchmark.py
+│   ├── recovery_bench.py
+│   └── memory_probe.sh
+└── docs/
+    ├── runtime_walkthrough.md
+    ├── interview_alignment.md
+    └── benchmark_method.md
 
-当前真正的运行主线是：
+File responsibilities
 
-client
-  ↓
-tcp + custom protocol
-  ↓
+File
+
+Role
+
 tcp_server.c
-  ↓
-codec.c
-  ↓
-do_request
-  ↓
-db.c / persist.c
-  ↓
-Resp
-  ↓
-codec.c
-  ↓
-client
 
-17. 从最初版本到现在，项目是怎么长出来的？
+server startup, poll, connection state, command dispatch
 
-ch00  整理项目结构 / docs / archive
-  ↓
-ch01  把 KV 存储从 server 拆成独立 db.*
-  ↓
-ch02  线性存储 → 哈希桶 + 链表
-  ↓
-ch03  加入扩容 / rehash
-  ↓
-ch04  加入 DEL
-  ↓
-ch05  加入 EXISTS
-  ↓
-ch06  响应语义升级为 OK / ERR / STR / INT / NIL
-  ↓
-ch07  加入 EXPIRE / TTL + 懒删除
-  ↓
-ch08  加入 SAVE + 启动加载快照
+tcp_client.c
 
-archive/ 不是运行代码，而是刻意保留的旧阶段切片。
+interactive test client
 
-它能让人看到设计是怎样一步步从：
+resp.c
 
-“TCP 能收发”
+RESP2 parsing / encoding
 
-演进成：
+db.c
 
-“有网络层、协议层、命令层、哈希存储、过期语义、快照恢复的最小数据库服务”
+hash table, rehash, expiration
 
-18. 编译与运行
+aof.c
 
-环境：Linux / WSL + GCC + Make。
+append, fsync, replay, repair, rewrite
+
+nb.c
+
+non-blocking fd setup
+
+12. Build and run
+
+Build
 
 make
 
-生成：
-
-./server
-./client
-
-清理：
-
-make clean
-
-终端 1：
+Start server
 
 ./server
 
-终端 2：
+Start client
 
 ./client
 
-示例：
+Example session
 
 > SET foo bar
 < OK
@@ -990,124 +649,246 @@ make clean
 > TTL foo
 < 2
 
-# 等待超过 2 秒
+# wait > 2 seconds
 > GET foo
 < (nil)
 
-> SET name chuan
+> AOFREWRITE
 < OK
 
-> SAVE
-< OK
+13. Testing and measurement
 
-重新启动 server 后，如果 my_redis.dump 中仍有有效数据，会在启动阶段恢复。
+Integration test
 
-19. 当前实现的真实边界
+make test
 
-这个仓库刻意区分“已经实现”和“计划实现”。
+Covered scenarios include:
 
-目前还没有：
+PING
 
-Redis 官方 RESP 兼容
+SET / GET
 
-redis-cli 直接连接兼容
+EXISTS / DEL
 
-AOF append-only log
+EXPIRE / TTL
 
-后台自动 snapshot
+expired GET returns nil
 
-主从复制 / Sentinel / Cluster
+AOF rewrite
 
-多线程命令执行
+restart + replay
 
-epoll
+expiring data does not revive after restart
 
-主动定期过期扫描
+truncated AOF tail repair
 
-List / Set / Hash / ZSet 等 Redis 数据类型
+The same integration flow has also been run with AddressSanitizer + UndefinedBehaviorSanitizer.
 
-完整引号/转义 CLI 解析（当前 client 只按空格 strtok）
+Performance tools
 
-生产级 crash consistency / checksum / fsync 策略
+python3 tools/benchmark.py -n 10000 --value-size 64
+python3 tools/recovery_bench.py --keys 10000 --value-size 64
+./tools/memory_probe.sh <server_pid>
 
-另外，当前 tcp_server.c 还保留了一段旧阶段的 PING/ECHO 风格函数 conn_make_resp，用于展示演进痕迹；它不在当前主执行路径中。
+One sanity run from the build environment
 
-当前最准确的定位是：
+Test
 
-一个以学习数据库和服务端底层机制为目标的单线程、poll 驱动、Redis-like 字符串 KV 服务。
+Result
 
-20. 下一步可以往哪里继续？
+Requests
 
-按当前结构，比较自然的路线是：
+10,000
 
-① 增加自动化测试
-② 清理旧主线代码 / 降低 tcp_server.c 职责
-③ 主动过期扫描
-④ 把当前协议演进为真正 RESP2 / RESP3 子集
-⑤ 增加 AOF + replay
-⑥ 增加 append / fsync 策略
-⑦ benchmark：吞吐、P50/P95、不同 key 数下 rehash 影响
-⑧ epoll / 更完整事件循环
-⑨ 更多数据类型
-⑩ 再考虑线程、分片、高可用
+Value size
 
-如果继续做 AOF，建议保持和当前 snapshot 分开理解：
+64 B
 
-当前 SAVE snapshot
-= 某个时间点把“现在的数据库状态”拍一张照片
+Transport
 
-未来 AOF
-= 每次写命令都追加一条操作日志，重启时通过 replay 重建状态
+loopback
 
-21. 源码阅读顺序
+fsync
 
-第一次看代码，建议不要按目录字母顺序看，而是沿一次请求走：
+no
+
+Average latency
+
+~0.042 ms
+
+P95
+
+~0.056 ms
+
+P99
+
+~0.120 ms
+
+Throughput
+
+~22k req/s
+
+Recovery smoke test
+
+Metric
+
+Result
+
+Keys
+
+10,000
+
+Value size
+
+64 B
+
+AOF size
+
+~0.91 MiB
+
+Restart-to-accept
+
+~0.022 s
+
+These numbers are sanity checks from one environment. Resume claims should be based on a fixed test setup on the actual target machine, with raw output retained.
+
+14. Implemented vs not implemented
+
+✅ Implemented
+
+❌ Not implemented
+
+RESP2 basic types and command arrays
+
+Full Redis command set
+
+poll + non-blocking sockets
+
+List / Set / Hash / ZSet
+
+Hash table + separate chaining
+
+MULTI / EXEC
+
+One-shot rehash
+
+Lua
+
+SET GET DEL EXISTS
+
+Pub/Sub
+
+EXPIRE TTL PTTL
+
+Replication / Sentinel / Cluster
+
+Lazy expiration + budgeted scan
+
+Incremental rehash
+
+AOF append / fsync / replay
+
+Background AOF rewrite
+
+Tail repair
+
+Redis allocator / jemalloc metrics
+
+Synchronous AOF rewrite
+
+Full RESP3
+
+Limits for large / malformed frames
+
+Production-grade crash consistency protocol
+
+15. Interview map
+
+The most useful line to remember is:
+
+SET from client
+   ↓
+RESP2 encode
+   ↓
+TCP byte stream
+   ↓
+poll says readable
+   ↓
+Conn.rbuf accumulates partial data
+   ↓
+RESP2 parser extracts one full command
+   ↓
+validate command / limits
+   ↓
+AOF append + fsync policy
+   ↓
+hash-table db_set / possible rehash
+   ↓
++OK
+   ↓
+non-blocking write
+
+<details>
+<summary><strong>Questions this path naturally opens up</strong></summary>
+
+Why can TCP split one command across multiple reads?
+
+How is a RESP Bulk String length validated?
+
+How are maliciously large frames limited?
+
+How are hash collisions handled?
+
+Why can one-shot rehash cause a latency spike?
+
+Why must SET copy data instead of storing a pointer into the request buffer?
+
+Why is the AOF itself encoded as RESP2 commands?
+
+What is the difference between append, fsync, replay, and rewrite?
+
+What happens if the AOF ends with half a command?
+
+Why are both lazy expiration and periodic scanning needed?
+
+Why does the periodic scan need a fixed budget?
+
+See docs/interview_alignment.md for code-to-question mapping.
+
+</details>
+
+16. Reading order
+
+For a first pass through the source, follow one request instead of reading files alphabetically:
 
 1. src/tcp_server.c
-   main / Conn / poll
+      poll / Conn / command dispatch
 
-2. src/tcp_client.c
-   build_req
+2. src/resp.c
+      RESP2 parser + encoder
 
-3. include/proto.h + src/proto.c
-   消息边界
+3. src/db.c
+      hash table / collision / rehash / expiration
 
-4. include/codec.h + src/codec.c
-   Args / Resp / 编解码
+4. src/aof.c
+      append / fsync / replay / repair / rewrite
 
-5. tcp_server.c
-   do_request
+5. src/tcp_client.c
+      interactive request generation
 
-6. include/db.h + src/db.c
-   哈希表 / rehash / expire
+6. tests/integration.py
+      observe the complete external behavior
 
-7. include/persist.h + src/persist.c
-   SAVE / load
+Summary
 
-8. docs/runtime_walkthrough.md
-   再把整条链串一次
+Client command
+    → RESP2
+    → TCP
+    → poll + non-blocking Conn state
+    → incremental parser
+    → command dispatch
+    → AOF + Hash DB + TTL
+    → RESP2 response
+    → client output
 
-更完整的逐函数运行轨迹已经放在：
-
-docs/runtime_walkthrough.md
-
-docs/ch00_notes.md ~ docs/ch08_notes.md
-
-archive/：历史阶段代码与计划记录
-
-22. 一句话总结
-
-终端命令
-  → 自定义二进制协议
-  → TCP
-  → poll + 非阻塞 Conn 状态机
-  → Args
-  → 命令分发
-  → 哈希表 KV / TTL / Snapshot
-  → Resp
-  → 网络响应
-  → client 输出
-
-这个项目的重点不是“实现了多少 Redis 命令”，而是亲手把一个网络数据库最核心的几层真正连接起来：
-
-连接如何被管理、TCP 字节如何组成消息、请求如何被解析、数据如何在内存中组织、过期如何影响查询、状态如何落盘，以及结果最后如何回到客户端。
+The value of the project is not the number of Redis commands implemented. The value is that the critical layers of a small network database are connected end to end and can be traced from socket bytes → protocol frame → command → memory structure → persistence → response.
