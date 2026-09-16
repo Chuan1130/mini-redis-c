@@ -363,7 +363,7 @@ When the predicted load factor exceeds about `0.75`, the table doubles:
 ```mermaid
 flowchart LR
     OLD[Old buckets] --> WALK[Walk every DbNode]
-    WALK --> HASH[hash(key) % new_bucket_count]
+    WALK --> HASH["hash(key) % new_bucket_count"]
     HASH --> LINK[Relink node into new bucket]
     LINK --> NEXT{more nodes?}
     NEXT -->|yes| WALK
